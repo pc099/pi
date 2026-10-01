@@ -314,6 +314,8 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	/** Cancellation survives the active agent controller and prevents post-run recovery. */
+	private _agentRunCancelled = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -719,6 +721,7 @@ export class AgentSession {
 	};
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
+		if (this._agentRunCancelled) return false;
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
 			return false;
@@ -1098,14 +1101,28 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
+	private _discardCancelledContinuation(): boolean {
+		if (!this._agentRunCancelled) return false;
+		this.clearQueue();
+		if (this._retryAttempt > 0) {
+			const attempt = this._retryAttempt;
+			this._retryAttempt = 0;
+			this._emit({ type: "auto_retry_end", success: false, attempt, finalError: "Run cancelled" });
+		}
+		return true;
+	}
+
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		this._isAgentRunActive = true;
 		try {
+			if (this._discardCancelledContinuation()) return;
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
+				if (this._discardCancelledContinuation()) break;
 				await this.agent.continue();
 			}
 		} finally {
+			this._discardCancelledContinuation();
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
@@ -1116,12 +1133,15 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
+		if (this._discardCancelledContinuation()) return false;
 		if (!msg) {
 			return false;
 		}
 
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return true;
+		if (this._isRetryableError(msg)) {
+			const retry = await this._prepareRetry(msg);
+			if (this._discardCancelledContinuation()) return false;
+			if (retry) return true;
 		}
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
@@ -1134,9 +1154,10 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		if (await this._checkCompaction(msg)) {
-			return true;
-		}
+		if (this._discardCancelledContinuation()) return false;
+		const compacted = await this._checkCompaction(msg);
+		if (this._discardCancelledContinuation()) return false;
+		if (compacted) return true;
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
@@ -1173,6 +1194,9 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		// A new explicit prompt gets a fresh cancellation scope before asynchronous
+		// input/auth/preflight hooks. Internal retry/continuation never resets it.
+		if (!this.isStreaming) this._agentRunCancelled = false;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1207,6 +1231,10 @@ export class AgentSession {
 				return;
 			}
 			const { text: currentText, images: currentImages } = processedInput;
+			if (this._discardCancelledContinuation()) {
+				preflightResult?.(true);
+				return;
+			}
 
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
@@ -1258,8 +1286,16 @@ export class AgentSession {
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
+			if (this._discardCancelledContinuation()) {
+				preflightResult?.(true);
+				return;
+			}
 			if (lastAssistant) {
 				await this._checkCompaction(lastAssistant, false);
+			}
+			if (this._discardCancelledContinuation()) {
+				preflightResult?.(true);
+				return;
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1442,6 +1478,7 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		if (this.isStreaming && this._agentRunCancelled) return;
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -1459,6 +1496,7 @@ export class AgentSession {
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		if (this.isStreaming && this._agentRunCancelled) return;
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -1516,12 +1554,14 @@ export class AgentSession {
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
+			if (this._agentRunCancelled) return;
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(appMessage);
 			} else {
 				this.agent.steer(appMessage);
 			}
 		} else if (options?.triggerTurn) {
+			this._agentRunCancelled = false;
 			await this._runAgentPrompt(appMessage);
 		} else if (this.isStreaming) {
 			// Appending now would put the message between an assistant tool call and its
@@ -1638,6 +1678,8 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._agentRunCancelled = true;
+		this.clearQueue();
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();
@@ -2279,6 +2321,7 @@ export class AgentSession {
 			}
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
+			if (this._agentRunCancelled) return false;
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2287,9 +2330,9 @@ export class AgentSession {
 				return false;
 			}
 
-			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
+			this._emit({ type: "compaction_start", reason });
 
 			let extensionCompaction: CompactionResult | undefined;
 
@@ -2325,6 +2368,9 @@ export class AgentSession {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+			}
+			if (this._autoCompactionAbortController.signal.aborted) {
+				throw new Error("Compaction cancelled");
 			}
 
 			let summary: string;
@@ -2426,22 +2472,24 @@ export class AgentSession {
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {
-				const formattedErrorMessage =
-					reason === "overflow"
+				const aborted = this._autoCompactionAbortController?.signal.aborted ?? false;
+				const formattedErrorMessage = aborted
+					? undefined
+					: reason === "overflow"
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`;
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
-					aborted: false,
+					aborted,
 					willRetry: false,
 					errorMessage: formattedErrorMessage,
 				});
 				await this._emitSessionCompactFailed({
 					reason,
 					errorMessage: formattedErrorMessage,
-					aborted: false,
+					aborted,
 					willRetry: false,
 					fromExtension,
 				});
@@ -2649,11 +2697,14 @@ export class AgentSession {
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {
-					if (this._extensionAbortHandler) {
-						this._extensionAbortHandler();
-						return;
+					// The mode may restore queued input to its editor. Mark cancellation
+					// first, let it collect that input, then always stop the core runtime.
+					this._agentRunCancelled = true;
+					try {
+						this._extensionAbortHandler?.();
+					} finally {
+						void this.abort();
 					}
-					void this.abort();
 				},
 				hasPendingMessages: () => this.pendingMessageCount > 0,
 				shutdown: () => {
@@ -2937,6 +2988,7 @@ export class AgentSession {
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
 		});
+		if (this._discardCancelledContinuation()) return false;
 
 		// Remove error message from agent state (keep in session for history)
 		const messages = this.agent.state.messages;
