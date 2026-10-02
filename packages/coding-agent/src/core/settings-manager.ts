@@ -265,15 +265,28 @@ export class FileSettingsStorage implements SettingsStorage {
 		const dir = dirname(path);
 
 		let release: (() => void) | undefined;
+		let readOnlyLockError: unknown;
 		try {
 			// Only create directory and lock if file exists or we need to write
 			const fileExists = existsSync(path);
 			if (fileExists) {
-				release = this.acquireLockSyncWithRetry(path);
+				try {
+					release = this.acquireLockSyncWithRetry(path);
+				} catch (error) {
+					const code =
+						typeof error === "object" && error !== null && "code" in error
+							? String((error as { code?: unknown }).code)
+							: undefined;
+					if (code !== "EROFS" && code !== "EACCES") throw error;
+					// Immutable project settings remain readable without creating a
+					// sibling lock. A callback requesting a write must still fail.
+					readOnlyLockError = error;
+				}
 			}
 			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
 			const next = fn(current);
 			if (next !== undefined) {
+				if (readOnlyLockError) throw readOnlyLockError;
 				// Only create directory when we actually need to write
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
